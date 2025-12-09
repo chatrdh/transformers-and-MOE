@@ -1,5 +1,5 @@
 import torch
-from basic_transformer.transformerlm import Linear, softmax, SwiGLU ,RMSNorm ,multihead_self_attention
+from basic_transformer.transformerlm import Linear,Embedding, softmax, SwiGLU ,RMSNorm ,multihead_self_attention
 import einops
 
 class topk(torch.nn.Module):
@@ -21,7 +21,7 @@ class topk(torch.nn.Module):
         
         # Calculate P_i: average probabilities across all tokens
         # Shape: (batch, seq, num_experts) -> (num_experts,)
-        P_i = soft_max_logits.mean(dim=(0, 1))
+        P_i = einops.reduce(soft_max_logits, 'B S E -> E', 'mean')
         
         return top_k_logits, top_k_indices, P_i
 
@@ -43,7 +43,7 @@ class MOELayer(torch.nn.Module):
         weights, indices, P_i = self.router(x)
         
         # Flatten inputs for processing
-        x_flat = einops.rearrange(x, 'b s d -> (b s) d')
+        x_flat = einops.rearrange(x, 'b s d -> (b s) d') #(output = (total_tokens,d_model))
         weights_flat = einops.rearrange(weights, '... k -> (...) k')
         indices_flat = einops.rearrange(indices, '... k -> (...) k')
         
@@ -97,7 +97,7 @@ class MOELayer(torch.nn.Module):
 
 
 class MOETransformerBlock(torch.nn.Module):
-     def __init__(self,d_model : int, num_heads:int , d_ff :int ,max_seq_len :int | None = None,theta : float | None =None):
+     def __init__(self,d_model : int, num_heads:int , d_ff :int ,num_experts: int, top_k: int,max_seq_len :int | None = None,theta : float | None =None):
           super().__init__()
           self.d_model = d_model
           self.num_heads = num_heads
@@ -108,11 +108,46 @@ class MOETransformerBlock(torch.nn.Module):
           self.rmsnorm2 = RMSNorm(self.d_model )
 
           self.multihead  = multihead_self_attention(self.d_model,self.num_heads,self.max_seq_len,self.theta)
-          self.ffn = MOELayer(d_model,d_ff,4,2)
+          self.ffn = MOELayer(d_model,d_ff,num_experts,top_k)
          
 
      def forward (self, x:torch.Tensor,token_positions: torch.Tensor | None = None):
           y = x + self.multihead(self.rmsnorm1(x),token_positions)
-          result,auxloss = y + self.ffn(self.rmsnorm2(y))
+          moe_out, aux_loss = self.ffn(self.rmsnorm2(y))
+          result = y + moe_out
 
-          return result,auxloss
+          return result,aux_loss
+
+
+
+class MoeLM(torch.nn.Module):
+     def __init__(self, vocab_size :int, num_layers :int , context_length : int,d_model : int,d_ff:int,num_heads :int,num_experts: int,top_k: int,theta : float | None =None):
+          super().__init__()
+          self.vocab_size = vocab_size
+          self.num_layers = num_layers
+          self.context_length = context_length
+          self.d_model = d_model
+          self.num_heads = num_heads
+          self.d_ff = d_ff
+          self.theta = theta
+          self.embedding = Embedding(self.vocab_size,d_model)
+          self.transformer_blocks = torch.nn.ModuleList([
+            MOETransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff,num_experts =num_experts,top_k=top_k, theta=theta,max_seq_len=context_length)
+            for _ in range(num_layers) ])
+
+          self.norm = RMSNorm(self.d_model)
+          self.linear = Linear(self.d_model, self.vocab_size)
+          
+     def forward(self, in_indices):
+          x = self.embedding(in_indices)     
+
+          for block in self.transformer_blocks:
+               x, layer_loss = block(x)
+               total_aux_loss += layer_loss
+          x = self.norm(x)
+          logits = self.linear(x)
+          return logits,total_aux_loss  
+     
+
+
+     

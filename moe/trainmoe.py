@@ -18,7 +18,7 @@ from basic_transformer.transformerlm import (
     load_checkpoint
 )
 from basic_transformer.tokenizer import Tokenizer
-from moelm import MoETransformerLM  # Import your MoE model
+from moelm import MoeLM# Import your MoE model
 
 
 class TrainingConfig:
@@ -92,7 +92,7 @@ class MemoryMappedDataset:
         self.context_length = context_length
         
         # Memory-map the data file
-        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+        self.data = np.memmap(data_path, dtype=np.uint8, mode='r')
         self.length = len(self.data)
         
         print(f"Loaded dataset from {data_path}")
@@ -110,8 +110,8 @@ class MemoryMappedDataset:
         targets = np.array([self.data[i + 1:i + self.context_length + 1] for i in start_indices])
         
         # Convert to PyTorch tensors and move to device
-        inputs_tensor = torch.tensor(inputs, dtype=torch.long, device=device)
-        targets_tensor = torch.tensor(targets, dtype=torch.long, device=device)
+        inputs_tensor = torch.tensor(inputs, dtype=torch.long)
+        targets_tensor = torch.tensor(targets, dtype=torch.long)
         
         return inputs_tensor, targets_tensor
 
@@ -175,7 +175,7 @@ def train(config: TrainingConfig):
     
     # Initialize MoE model
     print("\nInitializing MoE model...")
-    model = MoETransformerLM(
+    model = MoeLM(
         vocab_size=config.vocab_size,
         num_layers=config.num_layers,
         context_length=config.context_length,
@@ -189,7 +189,7 @@ def train(config: TrainingConfig):
     
     # Count parameters
     num_params = sum(p.numel() for p in model.parameters())
-    num_expert_params = sum(p.numel() for layer in model.layers for expert in layer.moe_layer.experts for p in expert.parameters())
+    num_expert_params = sum(p.numel() for block in model.transformer_blocks for expert in block.ffn.experts for p in expert.parameters())
     print(f"Total model parameters: {num_params:,}")
     print(f"Expert parameters: {num_expert_params:,}")
     print(f"Number of experts: {config.num_experts}")
@@ -236,7 +236,8 @@ def train(config: TrainingConfig):
         
         # Get batch
         inputs, targets = train_dataset.get_batch(config.batch_size, config.device)
-        
+        inputs = inputs.to(config.device, non_blocking=True)
+        targets = targets.to(config.device, non_blocking=True)
         # Forward pass (returns logits and auxiliary loss)
         logits, aux_loss = model(inputs)
         
@@ -384,8 +385,8 @@ def main():
     parser.add_argument('--eval_steps', type=int, default=100)
     
     # Paths
-    parser.add_argument('--train_data_path', type=str, default='data/train.bin')
-    parser.add_argument('--val_data_path', type=str, default='data/val.bin')
+    parser.add_argument('--train_data_path', type=str, default='data/train.txt')
+    parser.add_argument('--val_data_path', type=str, default='data/test.txt')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_moe')
     parser.add_argument('--resume_from', type=str, default=None)
     
