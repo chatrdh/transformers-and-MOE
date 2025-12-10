@@ -151,3 +151,156 @@ class MoeLM(torch.nn.Module):
 
 
      
+
+
+
+### Dynamic -k Routing Code ....
+
+class DynamicK(torch.nn.Module):
+    def __init__ (self,d_model :int,num_experts:int, confidence_threshold :float):
+        super().__init__()
+        self.d_model = d_model
+        self.num_experts = num_experts
+        self.confidence_threshold = confidence_threshold
+        self.gate = Linear(d_model,num_experts)
+
+    def forward(self,x:torch.Tensor):
+        logits = self.gate(x)
+        probs = softmax(logits,-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+         #Cumulative Sum
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        # We select experts until the sum exceeds the threshold.
+        # CRITICAL LOGIC: We want to include the first expert that crosses the line.
+        # We do this by checking if the *cumulative sum excluding the current expert* # is less than the threshold.
+        # shifted_cumsum: The sum of probabilities *before* adding the current expert.
+        shifted_cumsum = cumulative_probs - sorted_probs
+        
+        # Create boolean mask
+        # Example (Threshold 0.8):
+        # Shifted: [0.0, 0.6, 0.85]
+        # Check:   [T,   T,    F  ] -> Keeps top 2 experts
+        is_active = shifted_cumsum < self.confidence_threshold
+        
+        # 3. Safety Net (Top-1 Guarantee)
+        # We enforce that the highest-ranked expert is ALWAYS active.
+        # This handles the edge case where expert_1 > threshold (e.g., 0.9 > 0.8).
+        # Without this, the mask might be all False for very confident tokens.
+        is_active[..., 0] = True
+# --- Step 5: Re-normalization ---
+        
+        # Zero out the non-selected experts
+        # We multiply the sorted probabilities by the boolean mask (True=1, False=0)
+        active_probs = sorted_probs * is_active.float()
+        
+        # Re-normalize so the selected experts sum to 1.0
+        # active_probs.sum(dim=-1) gives the total mass of selected experts
+        total_mass = active_probs.sum(dim=-1, keepdim=True)
+        
+        # Safety: Add epsilon to avoid division by zero (though Top-1 guarantee makes this rare)
+        active_weights = active_probs / (total_mass + 1e-6)
+        
+        
+        #  Un-sorting (Scatter back to original indices) 
+        
+        # We currently have weights in "Rank Order" (Best, 2nd Best...)
+        # We need to put them back into "Expert Order" (Expert 0, Expert 1...)
+        
+        # Initialize an empty tensor of zeros with the original shape
+        # Shape: (Batch, Seq, Num_Experts)
+        routing_weights = torch.zeros_like(probs)
+        
+        # Scatter the values back to their original positions
+        # dim=-1: Scatter along the expert dimension
+        # index=sorted_indices: The map of where each rank came from
+        # src=active_weights: The values to place
+        routing_weights.scatter_(dim=-1, index=sorted_indices, src=active_weights)
+        
+        
+        # --- Final Returns ---
+        
+        # 1. routing_weights: Sparse weights for the MoE layer (0.0 for inactive experts)
+        # 2. probs: Full raw probabilities (needed for Entropy Loss and Load Balance Loss)
+        # 3. active_count: How many experts were active (needed for Logging/Analysis)
+        active_count = is_active.sum(dim=-1)
+        
+        return routing_weights, probs, active_count
+
+
+
+
+class DynamicKMOELayer(torch.nn.Module):
+    def __init__(self, d_model: int, d_ff: int, num_experts: int, confidence_threshold: float = 0.8,):
+        super().__init__()
+        self.num_experts = num_experts
+        
+        # 1. The New Dynamic Router
+        # This handles the "Cumulative Confidence" logic
+        self.router = DynamicK(d_model, num_experts, confidence_threshold)
+        
+        # 2. The Experts
+        # Independent neural networks. 
+        # (Make sure SwiGLU is defined/imported from your transformerlm file)
+        self.experts = torch.nn.ModuleList([
+            SwiGLU(d_model, d_ff) for _ in range(num_experts)
+        ])
+
+    def forward(self,x : torch.Tensor):
+        batch_size, seq_len, _ = x.shape
+        
+
+        #get the router
+        weights, probs, active_counts = self.router(x)
+        # --- 2. Sparse Dispatch ---
+        final_output = torch.zeros_like(x)
+        
+        # Flatten for easy indexing: (Total_Tokens, d_model)
+        x_flat = einops.rearrange(x, 'b s d -> (b s) d')
+        weights_flat = einops.rearrange(weights, '... k -> (...) k')
+        for i in range(self.num_experts):
+            # Check which tokens selected Expert i
+            # We look for non-zero weights
+            active_mask = weights_flat[:, i] > 0.0
+            
+            # OPTIMIZATION: Early Exit
+            # If the mask is all False (no token picked this expert), skip it.
+            if not active_mask.any():
+                continue
+            
+            # A. Gather the specific tokens that need this expert
+            active_inputs = x_flat[active_mask]
+            
+            # B. Process them
+            expert_out = self.experts[i](active_inputs)
+            
+            # C. Weight the output by the router's confidence
+            # (e.g., if weight is 0.5, we only take half the signal)
+            scaling_factor = einops.rearrange(weights_flat[active_mask, i], 'n -> n 1')
+            weighted_out = expert_out * scaling_factor
+            
+            # D. Scatter (Add) back to the final output
+            final_output.view(-1, x.shape[-1])[active_mask] += weighted_out
+
+            
+            # --- 3. Loss Calculation ---
+        
+            # A. Load Balancing Loss
+            # Get fraction of tokens assigned to each expert
+            # (Convert boolean mask to float, sum up, divide by total tokens)
+            tokens_per_expert = (weights_flat > 0).float().sum(dim=0)
+            f_i = tokens_per_expert / (batch_size * seq_len)
+            
+            # Get average probability per expert
+            P_i = probs.view(-1, self.num_experts).mean(dim=0)
+            
+            # Standard auxiliary loss formula
+            loss_balance = self.num_experts * torch.sum(f_i * P_i)
+            
+            # B. Dynamic Sparsity Loss (Entropy)
+            # We calculate entropy per token, then average over the batch
+            # Add 1e-6 to avoid log(0) error
+            entropy_per_token = -torch.sum(probs * torch.log(probs + 1e-6), dim=-1)
+            loss_entropy = entropy_per_token.mean()
+
+            # Return everything needed
+            return final_output, loss_balance, loss_entropy, active_counts
