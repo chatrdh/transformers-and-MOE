@@ -410,3 +410,6 @@ class DynamicMOELM(torch.nn.Module):
         
         # Return Logits + The 2 Loss Components + The Stat
         return logits, total_balance_loss, total_entropy_loss, avg_active_experts
+    
+
+    
