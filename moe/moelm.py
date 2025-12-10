@@ -281,7 +281,7 @@ class DynamicKMOELayer(torch.nn.Module):
             # D. Scatter (Add) back to the final output
             final_output.view(-1, x.shape[-1])[active_mask] += weighted_out
 
-            
+
             # --- 3. Loss Calculation ---
         
             # A. Load Balancing Loss
@@ -304,3 +304,109 @@ class DynamicKMOELayer(torch.nn.Module):
 
             # Return everything needed
             return final_output, loss_balance, loss_entropy, active_counts
+
+
+class DynamicMOETransformerBlock(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, 
+                 num_experts: int, confidence_threshold: float = 0.8,
+                 max_seq_len: int | None = None, theta: float | None = None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        
+        # Norms (Same as before)
+        self.rmsnorm1 = RMSNorm(d_model)
+        self.rmsnorm2 = RMSNorm(d_model)
+
+        # Attention (Same as before)
+        self.multihead = multihead_self_attention(d_model, num_heads, max_seq_len, theta)
+        
+        # MOE Layer (UPDATED)
+        # We now initialize the DynamicMOELayer
+        self.ffn = DynamicKMOELayer(d_model, d_ff, num_experts, confidence_threshold)
+    
+    def forward(self, x: torch.Tensor):
+        # --- 1. Attention Sub-layer ---
+        # (Standard Residual Connection)
+        h = self.multihead(self.rmsnorm1(x))
+        x = x + h 
+
+        # --- 2. Dynamic MoE Sub-layer ---
+        # Apply Norm
+        normed_x = self.rmsnorm2(x)
+        
+        # UNPACKING 4 VALUES:
+        # moe_out: The tensor output
+        # l_bal:   Load balancing loss (scalar)
+        # l_ent:   Entropy/Sparsity loss (scalar)
+        # counts:  Tensor of active experts per token (for analysis)
+        moe_out, l_bal, l_ent, counts = self.ffn(normed_x)
+        
+        # Residual Add (only the tensor)
+        result = x + moe_out
+
+        # Return EVERYTHING
+        return result, l_bal, l_ent, counts
+    
+
+class DynamicMOELM(torch.nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, context_length: int, 
+                 d_model: int, d_ff: int, num_heads: int, 
+                 num_experts: int, confidence_threshold: float = 0.8, 
+                 theta: float | None = None):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        
+        self.embedding = Embedding(vocab_size, d_model)
+        
+        # Stack of Dynamic Blocks
+        self.transformer_blocks = torch.nn.ModuleList([
+            DynamicMOETransformerBlock(
+                d_model=d_model, 
+                num_heads=num_heads, 
+                d_ff=d_ff, 
+                num_experts=num_experts, 
+                confidence_threshold=confidence_threshold, # Dynamic Parameter
+                theta=theta, 
+                max_seq_len=context_length
+            )
+            for _ in range(num_layers) 
+        ])
+
+        self.norm = RMSNorm(d_model)
+        self.linear = Linear(d_model, vocab_size)
+
+
+    def forward(self, in_indices):
+        # x shape: (Batch, Seq_Len)
+        x = self.embedding(in_indices)     
+
+        # Initialize Accumulators
+        total_balance_loss = 0.0
+        total_entropy_loss = 0.0
+        total_active_experts = 0.0 # Just for tracking stats
+
+        for block in self.transformer_blocks:
+            # UNPACK 4 VALUES
+            x, l_bal, l_ent, counts = block(x)
+            
+            # Accumulate
+            total_balance_loss += l_bal
+            total_entropy_loss += l_ent
+            
+            # For logging: Track average active experts
+            # counts is (Batch, Seq), so we take the mean
+            total_active_experts += counts.float().mean()
+        
+        # Final Norm and Projection
+        x = self.norm(x)
+        logits = self.linear(x)
+        
+        # Average the expert count across layers for a global view
+        avg_active_experts = total_active_experts / len(self.transformer_blocks)
+        
+        # Return Logits + The 2 Loss Components + The Stat
+        return logits, total_balance_loss, total_entropy_loss, avg_active_experts
