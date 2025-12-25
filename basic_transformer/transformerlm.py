@@ -151,7 +151,9 @@ class RoPE(torch.nn.Module):
         # Rotation: [x0*cos - x1*sin, x1*cos + x0*sin]
         x0 = x[..., 0]
         x1 = x[..., 1]
-        
+        heads = x0.shape[1]
+        cos = einops.repeat(cos, 'b s h -> b heads s h', heads=heads)
+        sin = einops.repeat(sin, 'b s h -> b heads s h', heads=heads)
         x_rotated = torch.stack([
             x0 * cos - x1 * sin,
             x1 * cos + x0 * sin
